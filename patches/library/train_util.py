@@ -80,8 +80,6 @@ import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging, pil_resize
-# from library.utils import setup_logging, resize_image, validate_interpolation_fn
-# from library.utils import setup_logging, validate_interpolation_fn
 
 setup_logging()
 import logging
@@ -2979,6 +2977,49 @@ def load_image(image_path, alpha=False):
 	except (IOError, OSError) as e:
 		logger.error(f"Error loading file: {image_path}")
 		raise e
+
+def resize_image(image: np.ndarray, width: int, height: int, resized_width: int, resized_height: int, resize_interpolation: Optional[str] = None):
+    """
+    Resize image with resize interpolation. Default interpolation to AREA if image is smaller, else LANCZOS.
+
+    Args:
+        image: numpy.ndarray
+        width: int Original image width
+        height: int Original image height
+        resized_width: int Resized image width
+        resized_height: int Resized image height
+        resize_interpolation: Optional[str] Resize interpolation method "lanczos", "area", "bilinear", "bicubic", "nearest", "box"
+
+    Returns:
+        image
+    """
+
+    # Ensure all size parameters are actual integers
+    width = int(width)
+    height = int(height)
+    resized_width = int(resized_width)
+    resized_height = int(resized_height)
+
+    if resize_interpolation is None:
+        if width >= resized_width and height >= resized_height:
+            resize_interpolation = "area"
+        else:
+            resize_interpolation = "lanczos"
+
+    # we use PIL for lanczos (for backward compatibility) and box, cv2 for others
+    use_pil = resize_interpolation in ["lanczos", "lanczos4", "box"]
+
+    resized_size = (resized_width, resized_height)
+    if use_pil:
+        interpolation = get_pil_interpolation(resize_interpolation)
+        image = pil_resize(image, resized_size, interpolation=interpolation)
+        logger.debug(f"resize image using {resize_interpolation} (PIL)")
+    else:
+        interpolation = get_cv2_interpolation(resize_interpolation)
+        image = cv2.resize(image, resized_size, interpolation=interpolation)
+        logger.debug(f"resize image using {resize_interpolation} (cv2)")
+
+    return image
 
 
 # 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top, crop right, crop bottom)
