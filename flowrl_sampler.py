@@ -1,6 +1,6 @@
 import os, re, math, random, json
 from collections import Counter, deque, defaultdict
-from typing import List, Dict, Optional, Iterable
+from typing import List, Dict, Optional, Iterable, Tuple, Any
 import torch
 from torch.utils.data import Sampler
 
@@ -26,7 +26,7 @@ def _read_tags(txt_path: str, tag_regex: Optional[str]) -> List[str]:
 def _kl(q: Dict[str, float], p: Dict[str, float]) -> float:
     s = 0.0
     for k, qv in q.items():
-        if qv <= 0.0: 
+        if qv <= 0.0:
             continue
         pv = p.get(k, 1e-12)
         s += qv * (math.log(max(qv, 1e-12)) - math.log(max(pv, 1e-12)))
@@ -221,3 +221,194 @@ class FlowRLBatchedSampler(Sampler[List[int]]):
             if r <= acc:
                 return i
         return len(probs) - 1
+
+
+
+class FlowRLSampler:
+    """
+    Plans an epoch ordering over pre-baked batches (buckets_indices) to improve
+    tag/Concept coverage. Safe: if we can't resolve batch images, returns the
+    original order unchanged.
+    """
+
+    def __init__(self,
+                 caption_extension: str = ".txt",
+                 temperature: float = 0.9,
+                 candidates: int = 6,
+                 window: int = 1024,
+                 diversity_bonus: float = 0.03,
+                 tag_regex: Optional[str] = None,
+                 seed: int = 42):
+        self.caption_ext = caption_extension
+        self.T = float(temperature)
+        self.C = int(candidates)
+        self.W = int(window)
+        self.diversity_bonus = float(diversity_bonus)
+        self.tag_regex = tag_regex
+        self.rng = random.Random(seed)
+
+        # rolling window state
+        self._window_batches: deque = deque(maxlen=self.W)
+        self._window_tags: Counter = Counter()
+
+    @classmethod
+    def from_args(cls, args):
+        # tolerate missing attributes (wrapper may inject them)
+        return cls(
+            caption_extension=getattr(args, "caption_extension", ".txt"),
+            temperature=getattr(args, "flowrl_temperature", 0.9),
+            candidates=getattr(args, "flowrl_candidates", 6),
+            window=getattr(args, "flowrl_window", 1024),
+            diversity_bonus=getattr(args, "flowrl_diversity_bonus", 0.03),
+            tag_regex=getattr(args, "flowrl_tag_regex", None),
+            seed=getattr(args, "seed", 42),
+        )
+
+    # ---- public API used by train_util.py ----
+    def build_epoch_indices(self,
+                            *,
+                            buckets_indices: List[Tuple[Any, ...]],
+                            bucket_manager: Any,
+                            image_data: Optional[dict],
+                            epoch: int) -> List[Tuple[Any, ...]]:
+        self.rng.seed(epoch)
+        self._window_batches.clear()
+        self._window_tags.clear()
+
+        # Precompute per-batch tag sets
+        batch_tags: List[set] = []
+        for bi in buckets_indices:
+            tags = self._tags_for_bucket_item(bi, bucket_manager, image_data)
+            batch_tags.append(tags)
+
+        # If we couldn't recover any tags, bail out safely
+        if not any(len(t) for t in batch_tags):
+            return list(buckets_indices)
+
+        # Uniform target over observed vocab
+        vocab = sorted({t for s in batch_tags for t in s})
+        p_target = {t: 1.0 / max(1, len(vocab)) for t in vocab}
+
+        # Plan order using FlowRL-style soft selection over C candidates each step
+        remaining = list(range(len(buckets_indices)))
+        planned_idx: List[int] = []
+
+        while remaining:
+            # pick C candidates without replacement
+            cand_ids = self._sample_without_replacement(remaining, k=min(self.C, len(remaining)))
+            rewards = []
+            for cid in cand_ids:
+                rewards.append(self._reward_if_add(batch_tags[cid], p_target))
+
+            # soft select
+            pick_local = self._soft_pick(rewards)
+            chosen_id = cand_ids[pick_local]
+            planned_idx.append(chosen_id)
+
+            # update window
+            self._add_to_window(batch_tags[chosen_id])
+            remaining.remove(chosen_id)
+
+        # return reordered buckets_indices
+        return [buckets_indices[i] for i in planned_idx]
+
+    # ---- internals ----
+
+    def _tags_for_bucket_item(self, item, bucket_manager, image_data) -> set:
+        """
+        Try to map a (bucket_index, batch_size, batch_index) item to the list of image paths
+        for that batch, then read their caption .txt files to form a tag set.
+        Works across common kohya forks; falls back to {} if we can't resolve.
+        """
+        paths = []
+        try:
+            # Common shape: (bucket_idx, batch_size, batch_idx)
+            if isinstance(item, (tuple, list)) and len(item) >= 3:
+                bidx, _, bbatch = item[0], item[1], item[2]
+            else:
+                # sometimes it's an object with attributes
+                bidx = getattr(item, "bucket_index", None)
+                bbatch = getattr(item, "batch_index", None)
+            # Heuristic 1: bucket_manager has .buckets[bidx].batches[bbatch] -> [image_keys]
+            bm = bucket_manager
+            if hasattr(bm, "buckets"):
+                bucket = bm.buckets[bidx]
+                cand = getattr(bucket, "batches", None) or getattr(bucket, "batch_images", None)
+                if cand:
+                    imgs = cand[bbatch]
+                    paths = self._image_keys_to_paths(imgs, image_data)
+            # Heuristic 2: direct helper
+            if not paths and hasattr(bm, "get_batch_image_keys"):
+                imgs = bm.get_batch_image_keys(bidx, bbatch)
+                paths = self._image_keys_to_paths(imgs, image_data)
+        except Exception:
+            paths = []
+
+        tags = set()
+        for p in paths:
+            root, _ = os.path.splitext(p)
+            txt_path = root + self.caption_ext
+            if os.path.exists(txt_path):
+                tags.update(_read_tags(txt_path, self.tag_regex))
+        return tags
+
+    def _image_keys_to_paths(self, imgs, image_data) -> List[str]:
+        out = []
+        if not imgs:
+            return out
+        # imgs may be strings (paths) or int keys into image_data
+        for x in imgs:
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, int) and image_data:
+                # image_data may be a dict keyed by int -> object with .image_path / .filepath
+                rec = image_data.get(x)
+                if isinstance(rec, dict):
+                    for k in ("image_path", "filepath", "path"):
+                        if k in rec and isinstance(rec[k], str):
+                            out.append(rec[k])
+                            break
+                else:
+                    for k in ("image_path", "filepath", "path"):
+                        if hasattr(rec, k):
+                            out.append(getattr(rec, k))
+                            break
+        return out
+
+    def _reward_if_add(self, batch_tagset: set, p_target: Dict[str, float]) -> float:
+        q_now = _norm(self._window_tags)
+        kl_now = _kl(q_now, p_target)
+        tmp = Counter(self._window_tags)
+        tmp.update(batch_tagset)
+        q_next = _norm(tmp)
+        kl_next = _kl(q_next, p_target)
+        coverage_gain = kl_now - kl_next
+
+        # light intra-batch diversity proxy (tag count)
+        div_bonus = self.diversity_bonus * math.log(1 + len(batch_tagset))
+        return coverage_gain + div_bonus
+
+    def _add_to_window(self, batch_tagset: set):
+        self._window_batches.append(batch_tagset)
+        self._window_tags.update(batch_tagset)
+        # prune if over window (deque already prunes by size)
+
+    def _soft_pick(self, rewards: List[float]) -> int:
+        if not rewards:
+            return 0
+        m = max(rewards)
+        exps = [math.exp((r - m) / max(self.T, 1e-6)) for r in rewards]
+        z = sum(exps) or 1.0
+        probs = [e / z for e in exps]
+        r = self.rng.random()
+        acc = 0.0
+        for i, p in enumerate(probs):
+            acc += p
+            if r <= acc:
+                return i
+        return len(probs) - 1
+
+    def _sample_without_replacement(self, pool: List[int], k: int) -> List[int]:
+        pool = list(pool)
+        self.rng.shuffle(pool)
+        return pool[:k]
