@@ -79,7 +79,7 @@ import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
-from library.utils import setup_logging, validate_interpolation_fn
+from library.utils import setup_logging, pil_resize
 
 setup_logging()
 import logging
