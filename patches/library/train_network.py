@@ -540,10 +540,22 @@ class NetworkTrainer:
 					}
 
 			blueprint = blueprint_generator.generate(user_config, args)
+
+			from library import strategy_base
+			# Tokenization strategy (SDXL-specific under the hood)
+			tokenize_strategy = self.get_tokenize_strategy(args)
+			strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+
+			# Latents caching strategy
+			latents_caching_strategy = self.get_latents_caching_strategy(args)
+			strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
+
+			# Text-encoder outputs caching strategy (may be None)
+			te_outs_strategy = self.get_text_encoder_outputs_caching_strategy(args)
+			if te_outs_strategy is not None:
+				strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(te_outs_strategy)
+
 			train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-			train_dataset_group.set_current_strategies()
-			if val_dataset_group is not None:
-				val_dataset_group.set_current_strategies()
 		else:
 			# use arbitrary dataset class
 			train_dataset_group = train_util.load_arbitrary_dataset(args)
