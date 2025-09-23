@@ -540,8 +540,7 @@ class NetworkTrainer:
 					}
 
 			blueprint = blueprint_generator.generate(user_config, args)
-
-			from library import strategy_base
+			
 			# Tokenization strategy (SDXL-specific under the hood)
 			tokenize_strategy = self.get_tokenize_strategy(args)
 			strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
