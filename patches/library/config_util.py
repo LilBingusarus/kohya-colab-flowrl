@@ -119,11 +119,6 @@ class DreamBoothDatasetParams(BaseDatasetParams):
 	bucket_no_upscale: bool = False
 	prior_loss_weight: float = 1.0
 
-	is_training_dataset: bool = True         # training dataset by default
-	validation_split: float = 0.0            # 0.0 = use all data for training
-	validation_seed: Optional[int] = None    # deterministic split if you set this
-	resize_interpolation: Optional[str] = None  # e.g. "lanczos", or leave None
-
 
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):
