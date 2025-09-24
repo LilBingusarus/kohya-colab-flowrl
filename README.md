@@ -1,6 +1,6 @@
 ## [ EXPERIMENTAL ] LoRA trainer + FlowRL sampler
 
-
+Use Lora_Trainer_XL_FLOWRL.ipynb to use the FlowRL sampler patch.
 
 # Kohya Colabs
 
